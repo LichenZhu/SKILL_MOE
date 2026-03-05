@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual env
+.venv/
+.env
+
+# Model weights
+*.pt
+*.pth
+*.onnx
+*.safetensors
+
+# Benchmarks
+benchmarks/
+
+# Logs
+*.log
+
