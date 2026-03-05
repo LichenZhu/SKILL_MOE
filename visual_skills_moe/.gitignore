@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+.env
+
+# OS
+.DS_Store
+
+# Media / demos
+*.mp4
+
+# Model weights
+*.pt
+*.pth
+*.onnx
+*.safetensors
+
+# Benchmark data & results
+benchmarks/data/
+benchmarks/results_*.csv
+benchmarks/log_*.json
+
+# Local notebooks / scratch
+*.ipynb_checkpoints
+*.log

@@ -1,0 +1,21 @@
+router:
+  strategy: auto          # "llm", "rules", or "auto" (try llm, fall back to rules)
+  model: gpt-4o-mini
+  max_tokens: 220         # enough for JSON thought/action payload
+
+answerer:
+  model: gpt-4o-mini
+  max_tokens: 256
+
+video_llm:
+  enabled: true
+  model_name: Qwen/Qwen2.5-Omni-7B
+  torch_dtype: auto
+  device_map: auto
+  max_frames: 96              # cap frame count to limit visual tokens
+  total_pixels: 20971520      # ~26,800 visual tokens, safe within 32K context
+  use_audio: true            # audio decoding often fails; disable by default
+
+skills_root: skills
+max_turns: 5              # max active-perception turns before forced FINISH
+max_skill_calls: null     # optional hard cap on skill calls per case

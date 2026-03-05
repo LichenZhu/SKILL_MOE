@@ -1,0 +1,26 @@
+router:
+  strategy: auto          # "llm", "rules", or "auto" (try llm, fall back to rules)
+  model: gpt-5.2-codex
+  max_tokens: 220         # enough for JSON thought/action payload
+
+answerer:
+  model: gpt-5.2-codex
+  max_tokens: 256
+
+video_llm:
+  enabled: true
+  model_name: Qwen/Qwen2.5-Omni-7B
+  torch_dtype: auto
+  device_map: auto
+  max_frames: 64              # cap frame count
+  total_pixels: 20971520      # ~26.8K visual tokens
+  use_audio: false            # audio decoding often fails; disable by default
+
+skills_root: skills
+max_turns: 5              # max active-perception turns before forced FINISH
+
+verifier:
+  enabled: false          # set true to gate skill evidence with gpt-4o-mini
+  model: gpt-5.2-codex
+  max_tokens: 10          # YES/NO reply — keep prompt cost minimal
+  timeout_s: 8.0          # per-call timeout; verifier skipped (fail-open) on timeout
