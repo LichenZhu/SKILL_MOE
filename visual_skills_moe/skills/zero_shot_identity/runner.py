@@ -26,9 +26,9 @@ import numpy as np
 from skill_moe.base import SkillMetadata, SkillRequest, SkillResponse
 from skill_moe.llm_clients import default_llm_client
 
-_NUM_FRAMES = int(os.getenv("ZSI_NUM_FRAMES", "4"))
-_MAX_CROPS_PER_FRAME = int(os.getenv("ZSI_MAX_CROPS_PER_FRAME", "3"))
-_YOLO_CONF = float(os.getenv("ZSI_YOLO_CONF", "0.30"))
+_NUM_FRAMES = int(os.getenv("ZSI_NUM_FRAMES", "8"))
+_MAX_CROPS_PER_FRAME = int(os.getenv("ZSI_MAX_CROPS_PER_FRAME", "4"))
+_YOLO_CONF = float(os.getenv("ZSI_YOLO_CONF", "0.20"))
 _YOLO_MODEL = os.getenv("ZSI_YOLO_MODEL", "yolov8n.pt")
 
 # ── Shared model caches ───────────────────────────────────────────────────────

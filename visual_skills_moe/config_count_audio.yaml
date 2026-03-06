@@ -1,10 +1,15 @@
+# Legacy / experiment-specific config:
+# - This file is for counting + audio ablations only.
+# - The main repo default is config.yaml.
+# - Keep fields aligned with skill_moe.config.PipelineConfig.
+
 router:
   strategy: auto          # "llm", "rules", or "auto" (try llm, fall back to rules)
-  model: gpt-4o-mini
+  model: gpt-5.2-codex
   max_tokens: 220         # enough for JSON thought/action payload
 
 answerer:
-  model: gpt-4o-mini
+  model: gpt-5.2-codex
   max_tokens: 256
 
 video_llm:
@@ -14,8 +19,7 @@ video_llm:
   device_map: auto
   max_frames: 96              # cap frame count to limit visual tokens
   total_pixels: 20971520      # ~26,800 visual tokens, safe within 32K context
-  use_audio: true            # audio decoding often fails; disable by default
+  use_audio: true             # enable audio for this experiment-specific config
 
 skills_root: skills
 max_turns: 5              # max active-perception turns before forced FINISH
-max_skill_calls: null     # optional hard cap on skill calls per case

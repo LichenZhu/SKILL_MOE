@@ -30,8 +30,8 @@ import numpy as np
 from skill_moe.base import SkillMetadata, SkillRequest, SkillResponse
 
 _SAMPLE_FRAMES = 24
-_THUMB_W = 320
-_THUMB_H = 240
+_THUMB_W = 480
+_THUMB_H = 360
 _MAX_GRID_SIDE = 2048
 
 # Triggers that indicate causal/narrative understanding is needed → Chronicle mode
@@ -157,7 +157,7 @@ def _build_grid(
         scale = _MAX_GRID_SIDE / max(h, w)
         canvas = cv2.resize(canvas, (int(w * scale), int(h * scale)))
 
-    ok, buf = cv2.imencode(".jpg", canvas, [cv2.IMWRITE_JPEG_QUALITY, 72])
+    ok, buf = cv2.imencode(".jpg", canvas, [cv2.IMWRITE_JPEG_QUALITY, 85])
     if not ok:
         return ""
     return base64.b64encode(buf.tobytes()).decode()

@@ -87,15 +87,26 @@ class VideoLLM:
         video_path: str,
         skill_context: Optional[str] = None,
         use_audio_in_video: Optional[bool] = None,
+        extra_instruction: Optional[str] = None,
     ) -> str:
+        """Answer the question.
+
+        extra_instruction — appended to the prompt *after* skill_context and
+        *before* the fixed reasoning footer.  Used by the reflection loop to
+        inject the <CALL_TOOL> option without modifying the baseline prompt.
+        """
         if use_audio_in_video is None:
             use_audio_in_video = self.use_audio
         try:
-            return self._generate(question, video_path, skill_context, use_audio_in_video)
+            return self._generate(
+                question, video_path, skill_context, use_audio_in_video, extra_instruction
+            )
         except Exception:
             if use_audio_in_video:
                 logger.warning("Audio decoding failed; retrying without audio.")
-                return self._generate(question, video_path, skill_context, False)
+                return self._generate(
+                    question, video_path, skill_context, False, extra_instruction
+                )
             raise
 
     def answer_images(
@@ -143,6 +154,7 @@ class VideoLLM:
         video_path: str,
         skill_context: Optional[str] = None,
         use_audio_in_video: bool = True,
+        extra_instruction: Optional[str] = None,
     ) -> str:
         # -- build conversation --
         user_content: list[dict] = [{
@@ -170,6 +182,8 @@ class VideoLLM:
                 " content, not the specific moment the question targets.\n"
                 "After </reasoning>, output ONLY the final answer letter (A, B, C, or D)."
             )
+        if extra_instruction:
+            text_parts.append(f"\n{extra_instruction}")
         user_content.append({"type": "text", "text": "\n".join(text_parts)})
 
         conversation = [

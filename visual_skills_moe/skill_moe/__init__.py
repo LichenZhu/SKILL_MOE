@@ -1,9 +1,10 @@
 """
 Skill-MoE skeleton package.
 
-Lightweight, research-oriented framework for routing video questions to
-specialized skills (OCR, ASR, motion tracking, etc.) instead of running a
-monolithic model on every frame.
+Lightweight, research-oriented framework for video multiple-choice QA.
+Routes questions to specialized skills (ASR, OCR, tracking, CLIP-based scoring,
+focus_vqa, etc.) and uses a local VLM (Qwen2.5-Omni-7B) for baseline answering
+and evidence-augmented re-answering.
 """
 
 from .base import (

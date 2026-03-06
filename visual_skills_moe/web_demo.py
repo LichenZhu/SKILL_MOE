@@ -59,12 +59,6 @@ def _init_pipeline(cfg: PipelineConfig, skip_video_llm: bool = False) -> None:
         strategy=cfg.router.strategy,
         llm_max_tokens=cfg.router.max_tokens,
     )
-    _pipeline = VideoUnderstandingPipeline(
-        registry,
-        router,
-        max_turns=cfg.max_turns,
-    )
-
     if cfg.video_llm.enabled and not skip_video_llm:
         from skill_moe.video_llm import VideoLLM
 
@@ -76,6 +70,13 @@ def _init_pipeline(cfg: PipelineConfig, skip_video_llm: bool = False) -> None:
             total_pixels=cfg.video_llm.total_pixels,
             use_audio=cfg.video_llm.use_audio,
         )
+
+    _pipeline = VideoUnderstandingPipeline(
+        registry,
+        router,
+        max_turns=cfg.max_turns,
+        video_llm=_video_llm,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +301,7 @@ def predict(
 
 def build_ui() -> gr.Blocks:
     with gr.Blocks(
-        title="Skill-MoE: Video Understanding with Iterative Reasoning",
+        title="Skill-MoE: Video Understanding",
         theme=gr.themes.Soft(),
         css="""
         .header-text { text-align: center; margin-bottom: 4px; }
@@ -311,7 +312,7 @@ def build_ui() -> gr.Blocks:
         gr.Markdown(
             "<h1 class='header-text'>Skill-MoE</h1>"
             "<p class='subheader'>"
-            "Mixture-of-Experts Video Understanding with ReAct Reasoning"
+            "Mixture-of-Experts Video Understanding"
             "</p>"
         )
 

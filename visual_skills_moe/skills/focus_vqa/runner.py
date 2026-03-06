@@ -318,10 +318,27 @@ def run(request: SkillRequest, meta: SkillMetadata) -> SkillResponse:
             artifacts={"error": "no_frames", "no_match": True},
         )
 
-    # ── Step 4: detect & rank ─────────────────────────────────────────────────
+    # ── Step 4: Pre-downscale frames to ≤1024px before GroundingDINO ─────────
+    # 4K frames (3840×2160) are ~16× larger than 1024px — GroundingDINO on them
+    # is disproportionately slow and yields no detection quality improvement.
+    # Pre-resize here; _spotlight_encode receives the same resized frame so box
+    # coordinates remain consistent without any extra scaling step.
+    _MAX_DETECT_PX = _CROP_MAX_SIDE  # reuse the 1024px constant
+    scaled_pairs: List[Tuple[float, Image.Image]] = []
+    for ts, pil_img in frame_ts_pairs:
+        w, h = pil_img.size
+        long_edge = max(w, h)
+        if long_edge > _MAX_DETECT_PX:
+            scale = _MAX_DETECT_PX / long_edge
+            pil_img = pil_img.resize(
+                (int(w * scale), int(h * scale)), Image.LANCZOS
+            )
+        scaled_pairs.append((ts, pil_img))
+
+    # ── Step 5: detect & rank ─────────────────────────────────────────────────
     # Store (score, ts, crop, orig_box, full_pil) for spotlight encoding.
     detections: List[Tuple[float, float, Image.Image, Any, Image.Image]] = []
-    for ts, pil_img in frame_ts_pairs:
+    for ts, pil_img in scaled_pairs:
         try:
             result = _detect_and_crop(pil_img, target, processor, gdino_model, device)
         except Exception as exc:
@@ -340,11 +357,11 @@ def run(request: SkillRequest, meta: SkillMetadata) -> SkillResponse:
             artifacts={"target": target, "crops_found": 0, "no_match": True},
         )
 
-    # ── Step 5: pick top-K crops by detection confidence ─────────────────────
+    # ── Step 6: pick top-K crops by detection confidence ─────────────────────
     detections.sort(key=lambda t: t[0], reverse=True)
     top = detections[:_MAX_CROPS]
 
-    # ── Step 6: encode as spotlight images (full-frame with darkened surround) ─
+    # ── Step 7: encode as spotlight images (full-frame with darkened surround) ─
     visual_evidence: List[str] = []
     crop_meta: List[Dict[str, Any]] = []
     for score, ts, crop, orig_box, full_pil in top:

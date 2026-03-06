@@ -29,8 +29,9 @@ def build_pipeline(
     skills_root: str = "skills",
     max_turns: int = 3,
     router_strategy: str = "auto",
-    router_model: str = "gpt-4o-mini",
+    router_model: str = "gpt-5.2-codex",
     router_max_tokens: int = 200,
+    video_llm: object = None,
 ) -> VideoUnderstandingPipeline:
     registry = SkillRegistry(root=skills_root)
     router_client = None
@@ -51,6 +52,7 @@ def build_pipeline(
         registry,
         router,
         max_turns=max_turns,
+        video_llm=video_llm,
     )
 
 
@@ -60,7 +62,7 @@ def main() -> None:
     parser.add_argument("--video", required=True, help="Path to video file")
     parser.add_argument("--config", default="config.yaml", help="Path to config YAML")
     parser.add_argument("--skills-root", default=None, help="Directory containing skill folders (overrides config)")
-    parser.add_argument("--max-turns", type=int, default=None, help="Max ReAct reasoning turns (overrides config)")
+    parser.add_argument("--max-turns", type=int, default=None, help="Max skill turns (overrides config)")
     parser.add_argument("--no-video-llm", action="store_true", help="Skip video LLM; use text-only answerer")
     args = parser.parse_args()
 
@@ -89,10 +91,11 @@ def main() -> None:
         router_strategy=cfg.router.strategy,
         router_model=cfg.router.model,
         router_max_tokens=cfg.router.max_tokens,
+        video_llm=video_llm,
     )
     request = SkillRequest(question=args.question, video_path=args.video)
 
-    # Run the iterative ReAct loop and get the full trace.
+    # Run the pipeline and get the full trace.
     trace = pipeline.run_trace(request)
 
     # Display the reasoning trace.

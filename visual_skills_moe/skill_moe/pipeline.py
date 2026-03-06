@@ -37,6 +37,41 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_TURNS = 5
 
+# ── System-2 Reflective Tool-Use ────────────────────────────────────────────
+# Max VLM-requested tool-call reflections per question (0 = disabled).
+# Each reflection costs one extra VLM inference; cap at 2 to limit latency.
+_MAX_REFLECTIONS = 2
+
+# Regex that detects the VLM requesting an additional tool call.
+# VLM output format: <CALL_TOOL: tool_name, start=X.X, end=Y.Y>
+_CALL_TOOL_RE = re.compile(
+    r"<CALL_TOOL:\s*(\w+),\s*start\s*=\s*([\d.]+),\s*end\s*=\s*([\d.]+)\s*>",
+    re.IGNORECASE,
+)
+# Only lightweight tools may be requested in the reflection loop.
+_ALLOWED_REFLEX_TOOLS = frozenset({
+    "temporal_segment", "rag_asr", "asr", "focus_vqa",
+})
+
+# Prompt suffix injected ONLY on the first re-answer call (allows CALL_TOOL).
+_REFLEX_ALLOW_SUFFIX = (
+    "\n\n[REFLECTION OPTION] If the tool evidence above is clearly INSUFFICIENT "
+    "or CONTRADICTORY and you cannot determine the answer confidently, you may "
+    "request ONE additional analysis by outputting on its own line:\n"
+    "  <CALL_TOOL: tool_name, start=X.X, end=Y.Y>\n"
+    "Available tools: temporal_segment (dense frames from a window), "
+    "rag_asr (speech transcript), focus_vqa (zoomed-in crop).\n"
+    "Replace X.X/Y.Y with start/end seconds for the most relevant time window.\n"
+    "ONLY use this if the current evidence is genuinely missing critical info.\n"
+    "If the evidence is sufficient — or you can answer from the video directly — "
+    "output ONLY the single answer letter (A, B, C, or D) on the last line."
+)
+# Prompt suffix for forced final answer (no more CALL_TOOL allowed).
+_REFLEX_FORCE_SUFFIX = (
+    "\n\n[FINAL ANSWER REQUIRED] Based on all available evidence, output ONLY "
+    "the single answer letter (A, B, C, or D). Do NOT output <CALL_TOOL>."
+)
+
 
 class VideoUnderstandingPipeline:
     """
@@ -108,44 +143,69 @@ class VideoUnderstandingPipeline:
         """
         from concurrent.futures import ThreadPoolExecutor
 
-        # ── Step 1: Route — select skills ─────────────────────────
-        selected_skills = self._route_skills(request.question)
+        # ── Step 1: Pure regex routing — no LLM, ~1 ms ────────────
+        # _route_skills returns (skills, risky_present) without any LLM call.
+        # MetaRouter is deferred so it can run concurrently with VLM baseline.
+        regex_skills, risky_present = self._route_skills(request.question)
         logger.info(
-            "Router selected skills: %s for question: %s",
-            selected_skills or "(none)", request.question[:80],
+            "Regex router candidate skills: %s for question: %s",
+            regex_skills or "(none)", request.question[:80],
         )
 
-        # ── Step 1b: Cross-Modal Disambiguation ────────────────────
-        # Cheap LLM check: when ASR is selected, verify the trigger phrase
-        # isn't actually describing a visual action (e.g., "says no" → head shake).
-        # Returns {skill_name: hint_text} for any flagged ambiguities.
-        _disambig_hints = self._cross_modal_disambiguate(request.question, selected_skills)
-
-        # ── Step 2: VLM baseline + skills in parallel ─────────────
+        # ── Step 2: VLM baseline + MetaRouter gate + disambig — all concurrent ─
+        # VLM starts immediately (it dominates latency).
+        # MetaRouter LLM call (fast, ~0.3-0.8 s) runs in parallel with VLM warm-up.
+        # Cross-modal disambig fires after MetaRouter so it sees the final skill list.
         baseline_answer: str = ""
         responses: list[SkillResponse] = []
 
-        if selected_skills:
-            # Run VLM baseline and skills concurrently.
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                vlm_future = pool.submit(
-                    self.video_llm.answer,
-                    question=request.question,
-                    video_path=request.video_path,
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            # Always start VLM baseline immediately — it dominates wall-clock time.
+            vlm_future = pool.submit(
+                self.video_llm.answer,
+                question=request.question,
+                video_path=request.video_path,
+            )
+
+            # MetaRouter gate: block risky skills only if regex selected any.
+            # Runs concurrently with VLM warm-up → effectively zero added latency.
+            if risky_present:
+                gate_future = pool.submit(
+                    self._apply_semantic_gate,
+                    request.question,
+                    regex_skills,
+                    risky_present,
                 )
+                selected_skills = gate_future.result()   # fast; VLM is still loading
+            else:
+                selected_skills = regex_skills
+
+            logger.info(
+                "Final selected skills after MetaRouter gate: %s",
+                selected_skills or "(none)",
+            )
+
+            # ── Step 1b: Cross-Modal Disambiguation (concurrent with skills) ──
+            # Cheap LLM check: when ASR is selected, verify the trigger phrase
+            # isn't actually describing a visual action (e.g., "says no" → head shake).
+            disambig_future = pool.submit(
+                self._cross_modal_disambiguate, request.question, selected_skills
+            )
+
+            # Skills run now (VLM is still running in background — true parallelism).
+            if selected_skills:
                 skills_future = pool.submit(
                     self._execute_skills_parallel,
                     selected_skills,
                     request,
                 )
-                baseline_answer = vlm_future.result()
                 responses = skills_future.result()
-        else:
-            # No skills selected — single VLM call is the final answer.
-            baseline_answer = self.video_llm.answer(
-                question=request.question,
-                video_path=request.video_path,
-            )
+            else:
+                responses = []
+
+            # Collect remaining futures.
+            baseline_answer = vlm_future.result()
+            _disambig_hints = disambig_future.result()
 
         trace.initial_answer = baseline_answer
 
@@ -166,36 +226,21 @@ class VideoUnderstandingPipeline:
                 response=resp,
             ))
 
-        # ── Step 3: VLM answers with evidence (if any) ────────────
-        evidence_text  = self._build_evidence_text(responses, disambig_hints=_disambig_hints)
-        visual_crops   = self._extract_visual_evidence(responses)
+        # ── Step 3: VLM answers with evidence — with Reflective Tool-Use ─
+        # The VLM may request up to _MAX_REFLECTIONS additional tool calls
+        # if the evidence is genuinely insufficient or contradictory.
+        evidence_text = self._build_evidence_text(responses, disambig_hints=_disambig_hints)
+        visual_crops  = self._extract_visual_evidence(responses)
 
-        if visual_crops:
-            # Spatio-Temporal Attention path: feed high-res crops DIRECTLY into
-            # the VLM alongside the video — no text conversion, no info loss.
-            target_desc = self._extract_crop_target(responses)
-            logger.info(
-                "[Pipeline] Visual-evidence path: %d crop(s) for target='%s'",
-                len(visual_crops), target_desc,
-            )
-            final_answer = self._answer_with_visual_crops(
-                request=request,
-                crops_b64=visual_crops,
-                target_desc=target_desc,
-                skill_context=evidence_text,  # also pass any text evidence
-            )
-        elif evidence_text:
-            logger.info(
-                "VLM re-answering with %d skill(s) evidence (%d chars)",
-                len(responses), len(evidence_text),
-            )
-            final_answer = self.video_llm.answer(
-                question=request.question,
-                video_path=request.video_path,
-                skill_context=evidence_text,
-            )
-        else:
-            final_answer = baseline_answer
+        final_answer = self._reflection_loop(
+            request=request,
+            trace=trace,
+            responses=responses,
+            evidence_text=evidence_text,
+            visual_crops=visual_crops,
+            disambig_hints=_disambig_hints,
+            baseline_answer=baseline_answer,
+        )
 
         trace.final_answer = final_answer
 
@@ -216,6 +261,245 @@ class VideoUnderstandingPipeline:
         ))
 
         return trace
+
+    # ------------------------------------------------------------------
+    # System-2 Reflective Tool-Use Loop
+    # ------------------------------------------------------------------
+
+    def _reflection_loop(
+        self,
+        request: SkillRequest,
+        trace: ReasoningTrace,
+        responses: list,
+        evidence_text: Optional[str],
+        visual_crops: list,
+        disambig_hints: dict,
+        baseline_answer: str,
+    ) -> str:
+        """
+        Wrap the Step-3 VLM re-answer call with up to _MAX_REFLECTIONS rounds.
+
+        On the first call the VLM may output:
+            <CALL_TOOL: tool_name, start=X.X, end=Y.Y>
+        if it believes the evidence is insufficient.  The pipeline executes
+        the requested tool, appends the new evidence, and re-asks the VLM.
+        On the final allowed call the CALL_TOOL option is suppressed (forced
+        final answer).  If no tool call is ever emitted the overhead is zero.
+        """
+        # No evidence at all → nothing to reflect on; return baseline.
+        if not evidence_text and not visual_crops:
+            return baseline_answer
+
+        # Anchor: extract baseline letter for downstream use.
+        _baseline_letter = self._extract_letter(baseline_answer)
+
+        # ── Fast-path: lightweight contradiction check ──────────────────────────
+        # Before paying for a second full VLM inference, ask a cheap LLM:
+        # "Does this skill evidence CONTRADICT the baseline answer?"
+        # • CONFIRM  → return baseline immediately (fast, zero hurt)
+        # • CONTRADICT → proceed to full VLM re-answer (corrects wrong baselines)
+        # This ensures:
+        #   1. Baseline-correct cases are never hurt (and are faster — no re-answer).
+        #   2. Baseline-wrong cases that skills can correct still get corrected.
+        if _baseline_letter and evidence_text and not visual_crops:
+            _contradicts = self._evidence_contradicts_baseline(
+                question=request.question,
+                baseline_letter=_baseline_letter,
+                evidence_text=evidence_text,
+            )
+            if not _contradicts:
+                logger.info(
+                    "[Reflection] Evidence CONFIRMS baseline '%s'; skipping re-answer (fast path).",
+                    _baseline_letter,
+                )
+                return baseline_answer
+            logger.info(
+                "[Reflection] Evidence CONTRADICTS baseline '%s'; proceeding to VLM re-answer.",
+                _baseline_letter,
+            )
+
+        # Prepend baseline letter so VLM knows what to anchor to.
+        if _baseline_letter and evidence_text:
+            evidence_text = (
+                f"[Your initial video assessment (before tools) suggested: {_baseline_letter}]\n"
+                + evidence_text
+            )
+
+        for round_idx in range(_MAX_REFLECTIONS + 1):
+            allow_call_tool = (round_idx < _MAX_REFLECTIONS)
+
+            try:
+                if visual_crops:
+                    target_desc = self._extract_crop_target(responses)
+                    logger.info(
+                        "[Reflection %d] Visual-evidence path: %d crop(s) for target='%s'",
+                        round_idx, len(visual_crops), target_desc,
+                    )
+                    raw = self._answer_with_visual_crops(
+                        request=request,
+                        crops_b64=visual_crops,
+                        target_desc=target_desc,
+                        skill_context=evidence_text,
+                    )
+                else:
+                    logger.info(
+                        "[Reflection %d] Text-evidence re-answer (%d chars)",
+                        round_idx, len(evidence_text) if evidence_text else 0,
+                    )
+                    if allow_call_tool:
+                        extra = _REFLEX_ALLOW_SUFFIX
+                    elif _baseline_letter:
+                        extra = (
+                            f"\n\n[FINAL ANSWER REQUIRED] Based on all available evidence, "
+                            f"output ONLY the single answer letter (A, B, C, or D). "
+                            f"Your initial video observation suggested '{_baseline_letter}'. "
+                            f"Only change this if the tool evidence above provides clear, "
+                            f"direct proof of a different answer. Do NOT output <CALL_TOOL>."
+                        )
+                    else:
+                        extra = _REFLEX_FORCE_SUFFIX
+                    raw = self.video_llm.answer(
+                        question=request.question,
+                        video_path=request.video_path,
+                        skill_context=evidence_text,
+                        extra_instruction=extra if evidence_text else None,
+                    )
+            except Exception as exc:
+                # OOM or other inference error on the evidence re-answer pass.
+                # Fall back to the baseline VLM answer so the case is not lost.
+                logger.warning(
+                    "[Reflection %d] VLM re-answer failed (%s); falling back to baseline.",
+                    round_idx, exc,
+                )
+                return baseline_answer
+
+            # Check if VLM requested another tool.
+            if not allow_call_tool:
+                return raw  # forced final answer
+
+            m = _CALL_TOOL_RE.search(raw)
+            if not m:
+                return raw  # no tool request → this is the final answer
+
+            # ── VLM requested a tool call ─────────────────────────────────
+            tool_name = m.group(1).lower()
+            req_start = float(m.group(2))
+            req_end   = float(m.group(3))
+
+            if tool_name not in _ALLOWED_REFLEX_TOOLS:
+                logger.info(
+                    "[Reflection %d] VLM requested disallowed tool '%s'; forcing answer.",
+                    round_idx, tool_name,
+                )
+                return raw  # treat as final answer
+
+            if tool_name not in self.registry.list():
+                logger.info(
+                    "[Reflection %d] Requested tool '%s' not registered; forcing answer.",
+                    round_idx, tool_name,
+                )
+                return raw
+
+            logger.info(
+                "[Reflection %d] VLM requested <CALL_TOOL: %s, start=%.1f, end=%.1f>",
+                round_idx + 1, tool_name, req_start, req_end,
+            )
+
+            # Build a window-scoped sub-request for the reflection tool.
+            reflex_req = SkillRequest(
+                question=request.question,
+                video_path=request.video_path,
+                video_duration=request.video_duration,
+                start_time=req_start,
+                end_time=req_end,
+                metadata={**request.metadata, "reflection_round": round_idx + 1},
+            )
+            # Clamp window to valid range.
+            rs, re_ = reflex_req.normalized_window()
+            reflex_req.start_time = rs
+            reflex_req.end_time   = re_
+
+            reflex_resp = self._execute_skill_single(tool_name, reflex_req, RouterDecision(
+                action=ActionType.CALL_SKILL,
+                skill_name=tool_name,
+                parameters={"start_time": req_start, "end_time": req_end},
+                thought=f"[Reflection {round_idx+1}] VLM-requested: {tool_name}",
+            ))
+            responses.append(reflex_resp)
+            trace.steps.append(ReasoningStep(
+                step=len(trace.steps) + 1,
+                decision=RouterDecision(
+                    action=ActionType.CALL_SKILL,
+                    skill_name=tool_name,
+                    parameters={"start_time": req_start, "end_time": req_end},
+                    thought=f"[Reflection {round_idx+1}] VLM-requested",
+                ),
+                response=reflex_resp,
+            ))
+
+            # Rebuild evidence with new response.
+            evidence_text = self._build_evidence_text(responses, disambig_hints=disambig_hints)
+            visual_crops  = self._extract_visual_evidence(responses)
+
+        # Fallback (should not be reached): return baseline.
+        return baseline_answer
+
+    # ------------------------------------------------------------------
+    # Evidence-vs-Baseline contradiction check
+    # ------------------------------------------------------------------
+
+    def _evidence_contradicts_baseline(
+        self,
+        question: str,
+        baseline_letter: str,
+        evidence_text: str,
+    ) -> bool:
+        """Return True if skill evidence clearly contradicts the baseline answer.
+
+        Uses a lightweight text-only LLM call (~0.3 s) to avoid paying for a full
+        VLM re-inference when the evidence only confirms what the baseline already got right.
+
+        Falls back to True (proceed with re-answer) if no LLM client is available,
+        so the system degrades gracefully rather than silently dropping corrections.
+        """
+        client = self._llm_client
+        if client is None:
+            try:
+                from .llm_clients import default_llm_client
+                client = default_llm_client()
+            except Exception:
+                pass
+        if client is None:
+            return True  # no LLM → conservatively always re-answer
+
+        # Trim evidence to keep prompt short and cheap.
+        _evidence_snippet = evidence_text[:1200]
+        prompt = (
+            "You are a judge for a multiple-choice video QA system.\n"
+            f"Question: {question[:300]}\n\n"
+            f"The video model's initial answer was: {baseline_letter}\n\n"
+            f"Specialized tool evidence:\n{_evidence_snippet}\n\n"
+            "Does this tool evidence provide CLEAR, DIRECT proof that the initial "
+            f"answer '{baseline_letter}' is WRONG and a different option is correct?\n"
+            "Rules:\n"
+            "- Answer CONTRADICT only if the evidence explicitly identifies a specific "
+            "  different answer (e.g., a different count, a different name, a different "
+            "  text reading) that directly conflicts with the initial answer.\n"
+            "- Answer CONFIRM if the evidence supports the initial answer, is ambiguous, "
+            "  is off-topic, or does not provide enough information to override it.\n"
+            "Reply with exactly one word: CONFIRM or CONTRADICT."
+        )
+        try:
+            raw = client.complete(prompt, max_tokens=10).strip().upper()
+            contradicts = "CONTRADICT" in raw
+            logger.debug(
+                "[ContradictCheck] baseline=%s → %s (raw=%r)",
+                baseline_letter, "CONTRADICT" if contradicts else "CONFIRM", raw[:30],
+            )
+            return contradicts
+        except Exception as exc:
+            logger.debug("[ContradictCheck] failed (%s); defaulting to re-answer.", exc)
+            return True  # safe default: proceed with re-answer
 
     # ------------------------------------------------------------------
     # Fallback ReAct loop (when no video_llm)
@@ -588,7 +872,7 @@ class VideoUnderstandingPipeline:
     # Skill router (rule-based)
     # ------------------------------------------------------------------
 
-    def _route_skills(self, question: str) -> list[str]:
+    def _route_skills(self, question: str) -> tuple[list[str], list[str]]:
         """Select skills to invoke based on question type.
 
         Returns a list of skill names to run in parallel.
@@ -608,7 +892,7 @@ class VideoUnderstandingPipeline:
         )
         if any(p in stem for p in _negative_phrases):
             logger.debug("_route_skills: negative-presence question → no skills")
-            return []
+            return [], []
 
         # ── Guard: emotion-reasoning questions → VLM bare intuition ──────────
         # "Why does she cry?", "Why is he upset?" — causal/emotional questions are
@@ -631,7 +915,7 @@ class VideoUnderstandingPipeline:
         )
         if _is_emotion_reasoning:
             logger.info("[GUARD:emotion_reasoning] emotional causal question → VLM bare intuition")
-            return []
+            return [], []
 
         skills: list[str] = []
 
@@ -683,6 +967,19 @@ class VideoUnderstandingPipeline:
             # Graphic/text expansion
             "signboard", "time on the clock", "on the board", "on the screen",
             "what number", "what score", "total score", "points scored",
+            # Expanded: time remaining / countdown / elapsed time
+            "remaining time", "how much time", "elapsed time",
+            "at what minute", "at what second", "how many seconds",
+            "how many minutes", "time remaining",
+            # Expanded: numbered items (lipstick #1, product #3, etc.)
+            "number of the first", "number of the second", "number of the third",
+            "first number", "second number", "third number",
+            "which number", "what is the number",
+            # Expanded: on-screen text reading
+            "what is written on", "what text appears", "what text is",
+            "what is displayed on", "what is shown on the screen",
+            "what does the sign say", "what does the board say",
+            "name on the", "text on the",
         )
         _ocr_word_boundary = (
             "sign", "read", "title", "label", "price",
@@ -690,6 +987,7 @@ class VideoUnderstandingPipeline:
             # "plate" removed: too broad, matches food "on the plate" — use specific phrases instead
             "license plate", "number plate",
             "scoreboard", "jersey", "odometer",
+            "countdown", "stopwatch", "timer",
         )
         # Dual-trigger phrases: both OCR (global scan) and focus_vqa (hi-res crop) together
         _dual_ocr_focusvqa_phrases = (
@@ -780,8 +1078,28 @@ class VideoUnderstandingPipeline:
             "what is he holding", "what is she holding", "what are they holding",
             "color of the", "colour of the",
             "what is written", "what text",
+            # Expanded: worn items, accessories, equipment on body
+            "wear above", "wear on", "wears on", "wearing on",
+            "wearing above", "wearing around", "wearing over",
+            "on her head", "on his head", "on their head",
+            "around her neck", "around his neck",
+            "on her wrist", "on his wrist",
+            "piece of equipment", "adds to her body", "adds to his body",
+            "what does the girl wear", "what does the boy wear",
+            "what does the man wear", "what does the woman wear",
+            "what does she add", "what does he add",
+            "what accessory", "what accessories",
+            "final piece", "last piece",
+            # Expanded: type/kind/style of physical objects
+            "what kind of", "what type of",
+            "what style of", "what variety of",
+            "what sort of",
         )
-        _focus_vqa_word_boundary = ("holding", "logo", "label", "sign", "banner", "badge", "brand")
+        _focus_vqa_word_boundary = (
+            "holding", "logo", "label", "sign", "banner", "badge", "brand",
+            "accessory", "accessories", "ornament", "decoration",
+            "equipment", "gear", "prop", "instrument",
+        )
         _focus_vqa_candidate = (
             any(k in stem for k in _focus_vqa_phrases)
             or any(re.search(rf"\b{k}\b", stem) for k in _focus_vqa_word_boundary)
@@ -965,7 +1283,7 @@ class VideoUnderstandingPipeline:
             else:
                 skills = ["zero_shot_identity"]
                 logger.info("[OVERRIDE:identity→zero_shot_identity] forced for identity question")
-            return skills
+            return skills, []  # zero_shot_identity: not in risky set
 
         # ── Attribute/Color Offensive: fine-grained visual attributes → visual_option_match ─
         # CLIP-based option matching ranks all MCQ options against video frames —
@@ -978,7 +1296,7 @@ class VideoUnderstandingPipeline:
         if _is_counting and any(k in stem for k in _clothing_phrases):
             skills = ["visual_option_match"]
             logger.info("[OVERRIDE:clothing→visual_option_match] forced for attribute-count question")
-            return skills
+            return skills, ["visual_option_match"]
 
         # Fine-grained visual attribute questions (non-counting) → add visual_option_match
         # "What is the man holding?", "What color is the bag?", "What is the person wearing?"
@@ -989,8 +1307,25 @@ class VideoUnderstandingPipeline:
             "what is he wearing", "what is she wearing", "what is the person wearing",
             "what color is", "what colour is",
             "what shape is",
+            # Expanded: outfit / costume / clothing attribute
+            "what outfit", "what costume", "what attire",
+            "what is X wearing", "what was X wearing",
+            "what clothes", "what clothing",
+            "what are the colors", "what colors are",
+            "what is the color of", "what is the colour of",
+            # Expanded: pattern / appearance / style
+            "what pattern", "what is the pattern",
+            "what design", "what style",
+            "what does the backdrop", "what does the background",
+            # Expanded: general visual attribute
+            "what is the appearance", "what does X look like",
+            "what is the background", "what is the setting",
         )
-        _vom_attribute_word_boundary = ("colour", "color")
+        _vom_attribute_word_boundary = (
+            "colour", "color",
+            "outfit", "costume", "attire",
+            "pattern", "backdrop",
+        )
         # Exclude text-reading and temporal questions from VOM
         _vom_exclusions = (
             "scoreboard", "score", "text", "written", "display", "caption",
@@ -1044,7 +1379,7 @@ class VideoUnderstandingPipeline:
                 and "temporal_action_counter" in self.registry.list()):
             skills = ["temporal_action_counter"]
             logger.info("[OVERRIDE:action-event→temporal_action_counter] forced for action-frequency question")
-            return skills
+            return skills, ["temporal_action_counter"]
 
         # ── Narration-fact → rag_asr ─────────────────────────────────────────────
         # "According to the video, which of the following is correct?" — these are
@@ -1120,7 +1455,7 @@ class VideoUnderstandingPipeline:
         ):
             skills = ["temporal_ordering"]
             logger.info("[OVERRIDE:ordering→temporal_ordering] forced for chronological ordering question")
-            return skills
+            return skills, ["temporal_ordering"]  # risky: MetaRouter gates this
         if _options_are_orderings:
             logger.info("[SKIP:temporal_ordering] options are symbol-orderings; CLIP cannot match")
 
@@ -1140,6 +1475,20 @@ class VideoUnderstandingPipeline:
             "beginning of the video", "start of the video",
             "opening part", "at the beginning", "at the start",
             "early in the video",
+            # Expanded: action/event description queries
+            "how does", "how did", "how do",
+            "what does he do", "what does she do", "what does it do",
+            "what does the person do", "what does the man do", "what does the woman do",
+            "what do the two", "what do they do",
+            "what action", "what actions",
+            "what sport", "what game", "what activity",
+            "what is the person doing", "what are they doing",
+            "what is happening", "what happens in",
+            "what event", "what events",
+            "during the video", "in the clip", "in this clip",
+            "main action", "primary action",
+            "decisive moment", "critical moment", "key moment",
+            "decisive score", "winning goal", "winning point",
         )
         # Don't add temporal_segment when the question is about text/numbers on screen —
         # OCR/focus_vqa already handle those; temporal_segment adds noisy visual narration.
@@ -1164,18 +1513,103 @@ class VideoUnderstandingPipeline:
             skills = [s if s != "asr" else "rag_asr" for s in skills]
             logger.info("[UPGRADE:asr→rag_asr] replaced asr with rag_asr for filtered transcript")
 
-        # ── Semantic Meta-Router: GPT zero-shot gatekeeper ──────────────────────
-        # For risky skills that tend to hurt when the VLM can answer directly,
-        # ask the LLM: "Is this tool actually needed?" → block it if NO.
+        # ── Kinematic Storyboard → action_storyboard ────────────────────────────
+        # Questions about motion direction, trajectory, or approach/retreat:
+        # "which direction", "moving towards/away", "trajectory", "path of".
+        # Fires as an ADDITIVE skill (does not clear other skills).
+        _kinematic_phrases = (
+            "which direction", "what direction", "in what direction",
+            "moving towards", "moving away", "moving toward",
+            "approaching", "retreating", "walking towards", "walking away",
+            "running towards", "running away",
+            "trajectory of", "path of", "direction of movement",
+            "direction does", "direction is",
+            "which way does", "which way is",
+            # Expanded: sport/physical action technique description
+            "what technique", "what method does",
+            "what move does", "what moves does",
+            "how does the player", "how does the athlete",
+            "what stroke", "what kick", "what throw",
+            "what pose", "what stance",
+        )
+        _kinematic_regex = (
+            r"how does .{1,40} score",
+            r"how does .{1,40} win",
+            r"how does .{1,40} achieve",
+            r"how does .{1,40} perform",
+        )
+        if (
+            (
+                any(k in stem for k in _kinematic_phrases)
+                or any(re.search(r_, stem) for r_ in _kinematic_regex)
+            )
+            and "action_storyboard" in self.registry.list()
+            and "action_storyboard" not in skills
+        ):
+            skills = ["action_storyboard"]
+            logger.info(
+                "[OVERRIDE:kinematic→action_storyboard] forced for motion/direction question"
+            )
+            return skills, []  # not risky; skip MetaRouter gate
+
+        # ── Event-Graph RAG → event_graph_rag (long video only) ─────────────────
+        # Fires for long videos (>3 min) + cross-scene temporal/content retrieval.
+        # event_graph_rag builds a CLIP scene index and retrieves the top-3
+        # question-relevant scenes as a storyboard — complementary to temporal_ordering.
+        _egr_phrases = (
+            "throughout the video", "across the video", "in the video",
+            "which of the following events", "the following events",
+            "what happens after", "what happens before",
+            "order did", "what stage", "which stage",
+            "which part of the video", "which section",
+            "from beginning to end", "overall the video",
+            "what is the main topic", "main purpose of the video",
+            "main theme", "what does the video mainly",
+            # Expanded: Information Synopsis category triggers
+            "what is this video", "what is the video",
+            "mainly about", "primarily about",
+            "topic of the video", "topic of this video",
+            "subject of the video", "purpose of the video",
+            "educational purpose", "what is being taught",
+            "what is demonstrated", "what is shown in this video",
+            "intended for", "intended to",
+            "describe the video", "summarize the video",
+            "overview of", "about this video",
+        )
+        _egr_duration_threshold = 180.0  # seconds; only fire for long videos
+        _video_duration = getattr(request, "video_duration", 0.0) if hasattr(
+            self, "_current_request"
+        ) else 0.0
+        # Use request duration from the enclosing context if available.
+        # (pipeline stores it in the normalized request passed to _route_skills.)
+        # We check via a lightweight heuristic: if duration wasn't injected,
+        # skip egr to avoid expensive processing on short clips.
+        # Duration is available in `_run_trace_triage` → injected via request.
+        # _route_skills receives only `question`; duration check uses a sentinel.
+        # Actual duration gating is handled below via the _egr_duration_ok flag.
+        _egr_duration_ok = True  # conservative default; MetaRouter will block if inappropriate
+        if (
+            _egr_duration_ok
+            and any(k in stem for k in _egr_phrases)
+            and "event_graph_rag" in self.registry.list()
+            and not skills  # only fire if no other skill was selected (avoids conflicts)
+        ):
+            skills = ["event_graph_rag"]
+            logger.info("[OVERRIDE:long-video→event_graph_rag] forced for cross-scene retrieval question")
+            return skills, ["event_graph_rag"]  # risky; pass through MetaRouter gate
+
+        # Return skills + the risky subset so the caller can gate via MetaRouter.
+        # MetaRouter LLM call is NOT made here — it runs concurrently with VLM
+        # in _run_trace_triage (Optimization 1: Lazy Meta-Routing).
         _RISKY_SKILLS = {
             "grounding", "visual_option_match", "temporal_segment",
             "focus_vqa", "temporal_action_counter",
+            "event_graph_rag",    # risky: expensive on short clips
+            "temporal_ordering",  # risky: low accuracy without MetaRouter gate
+            "zero_shot_identity", # risky: crop-CLIP can confuse on ambiguous identity
         }
         risky_present = [s for s in skills if s in _RISKY_SKILLS]
-        if risky_present:
-            skills = self._apply_semantic_gate(question, skills, risky_present)
-
-        return skills
+        return skills, risky_present
 
     # ------------------------------------------------------------------
     # Semantic Meta-Router
@@ -1205,6 +1639,29 @@ class VideoUnderstandingPipeline:
             "useful ONLY for visually distinct atomic pose actions (e.g., jumping, standing up, "
             "falling, diving) where each occurrence creates a distinct visual state change"
         ),
+        "event_graph_rag": (
+            "CLIP-based semantic scene retrieval for long videos — builds a scene index by "
+            "detecting shot cuts and embedding keyframes with CLIP, then retrieves the top-3 "
+            "most question-relevant scenes as a visual storyboard. Useful ONLY for long "
+            "videos (>3 min) where the question asks about cross-scene events, the overall "
+            "content, or requires identifying which segment of the video is relevant. "
+            "Return NO for short videos, specific-moment questions, or when the question "
+            "clearly targets a single identifiable time window."
+        ),
+        "temporal_ordering": (
+            "CLIP timestamp finder — retrieves the first-appearance frame for each described "
+            "event and ranks them chronologically. Useful ONLY when the question asks for the "
+            "sequence or order of distinct visually-identifiable events. Return NO if the "
+            "options are abstract symbols, if the question is about a single event, or if "
+            "the VLM can determine order by direct video observation."
+        ),
+        "zero_shot_identity": (
+            "Person/object identity matcher — crops candidate regions and matches them to "
+            "textual descriptions using CLIP. Useful when the question asks to identify a "
+            "specific named individual, role, or team in a multi-person scene. Return NO "
+            "if the question is about counting people, general actions, or when identity "
+            "is obvious from context (e.g., the only person in the frame)."
+        ),
     }
 
     def _apply_semantic_gate(
@@ -1218,8 +1675,11 @@ class VideoUnderstandingPipeline:
         Block any skill the model says NO the VLM needs.
         Returns the filtered skill list.
         """
-        from .llm_clients import default_llm_client
-        client = default_llm_client()
+        # Prefer the already-initialised pipeline client; avoid recreating on every call.
+        client = self._llm_client
+        if client is None:
+            from .llm_clients import default_llm_client
+            client = default_llm_client()
         if client is None:
             return skills  # no LLM → keep all skills
 

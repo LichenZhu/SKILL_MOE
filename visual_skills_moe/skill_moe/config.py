@@ -6,12 +6,12 @@ from pydantic import BaseModel
 
 class RouterConfig(BaseModel):
     strategy: str = "auto"  # "llm", "rules", or "auto" (try llm, fall back to rules)
-    model: str = "gpt-4o-mini"
+    model: str = "gpt-5.2-codex"
     max_tokens: int = 220
 
 
 class AnswererConfig(BaseModel):
-    model: str = "gpt-4o-mini"
+    model: str = "gpt-5.2-codex"
     max_tokens: int = 256
 
 
@@ -27,7 +27,7 @@ class VideoLLMConfig(BaseModel):
 
 class VerifierConfig(BaseModel):
     enabled: bool = False        # opt-in; set true to gate skill evidence quality
-    model: str = "gpt-4o-mini"
+    model: str = "gpt-5.2-codex"
     max_tokens: int = 10         # only YES/NO needed
     timeout_s: float = 8.0       # per-call timeout; verifier skipped on timeout
 

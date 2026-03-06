@@ -20,7 +20,7 @@ skills_root: skills
 max_turns: 5              # max active-perception turns before forced FINISH
 
 verifier:
-  enabled: false          # set true to gate skill evidence with gpt-4o-mini
+  enabled: false          # set true to gate skill evidence with LLM
   model: gpt-5.2-codex
   max_tokens: 10          # YES/NO reply — keep prompt cost minimal
   timeout_s: 8.0          # per-call timeout; verifier skipped (fail-open) on timeout

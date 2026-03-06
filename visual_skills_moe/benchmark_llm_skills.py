@@ -1,5 +1,12 @@
 """
-LLM + Skills benchmark: demonstrate skill value for video QA.
+[LEGACY] LLM + Skills benchmark: demonstrate skill value for video QA.
+
+This script references old skill names (object_detect, action, scene, face,
+motion, spatial, frame_vqa, shape_count) that no longer exist in the active
+skills/ directory. Kept for historical reference only.
+
+Do not use this script to evaluate the current Skill-MoE pipeline.
+Use benchmark.py instead.
 
 Runs each question twice:
   A) Baseline: LLM answers from question text only (no video access)

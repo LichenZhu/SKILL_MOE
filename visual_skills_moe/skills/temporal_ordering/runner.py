@@ -19,30 +19,32 @@ import numpy as np
 
 from skill_moe.base import SkillMetadata, SkillRequest, SkillResponse
 
-_SAMPLE_FPS = 1.0         # 1 fps — enough for ordering
-_MAX_FRAMES = 180          # cap at 3 minutes of scanning
-_CLIP_THRESHOLD = 0.22     # min similarity to count as "clearly present"
-_CLIP_FALLBACK_THR = 0.15  # use best-frame fallback if nothing exceeds threshold
+_SAMPLE_FPS = 2.0          # 2 fps — better temporal resolution
+_MAX_FRAMES = 300          # cap at ~2.5 minutes of scanning at 2fps
+_CLIP_THRESHOLD = 0.28     # ViT-H-14 scores are higher than ViT-B-32
+_CLIP_FALLBACK_THR = 0.22  # higher fallback bar to avoid spurious matches
 
 _model_cache: dict = {}
 
 
 # ---------------------------------------------------------------------------
-# CLIP model
+# CLIP model — reuse ViT-H-14 from visual_option_match (much stronger than ViT-B-32)
 # ---------------------------------------------------------------------------
 
 def _get_clip():
+    """Load ViT-H-14 via visual_option_match's shared model cache."""
     if "model" in _model_cache:
         return _model_cache["model"], _model_cache["meta"]
     try:
-        import open_clip
-        import torch
-        model, _, preprocess = open_clip.create_model_and_transforms(
-            "ViT-B-32", pretrained="openai"
-        )
-        tokenizer = open_clip.get_tokenizer("ViT-B-32")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = model.to(device).eval()
+        import importlib.util
+        from pathlib import Path
+        p = Path(__file__).parent.parent / "visual_option_match" / "runner.py"
+        spec = importlib.util.spec_from_file_location("_tord_visopt", str(p))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        model, preprocess, tokenizer, device = mod._get_model()
+        if model is None:
+            return None, None
         _model_cache["model"] = model
         _model_cache["meta"] = (preprocess, tokenizer, device)
         return model, (preprocess, tokenizer, device)
